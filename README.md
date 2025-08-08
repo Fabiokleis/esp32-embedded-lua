@@ -1,9 +1,12 @@
 # esp32-embedded-lua
 
-brincando com a vm lua embedada no esp32.
+brincando com a vm de lua embedada no esp32.
 
 tutorial de como criar interface com vm a lua:
 https://lucasklassmann.com/blog/2019-02-02-embedding-lua-in-c
+
+documentacao da linguagem lua: 
+https://www.lua.org/manual/5.3/manual.html
 
 ## components
 
