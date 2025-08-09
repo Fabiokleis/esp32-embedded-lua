@@ -14,11 +14,12 @@
 #include <lauxlib.h>
 
 // wifi sta custom component
+#include "portmacro.h"
 #include "wifi_sta.h"
 #include "info.h"
 
 // esp
-#include "esp_system.h"
+
 #include "esp_log.h"
 #include "esp_event.h"
 #include "esp_netif.h"
@@ -28,16 +29,29 @@
 #define LOW 0
 #define MAX_CODE_SIZE 1024
 
-static const char *TAG = "C_ESP32_RUNTIME";
-static const char *LUA_TAG = "LUA_FUNCTION_RUNTIME";
+static const char *TAG = "C_ESP32";
+static const char *LUA_TAG = "LUA_VM_TASK";
 
+static const char *MQTT_BROKER_URI = "mqtt://test.mosquitto.org";
 static const char *TOPIC_PING = "0/lua_blinker/ping";
 static const char *TOPIC_CODE = "0/lua_blinker/code/run";
 
-static char CODE[MAX_CODE_SIZE];
+static char CODE[MAX_CODE_SIZE]; // mqtt injected lua code
 
-SemaphoreHandle_t x_lua_code;
+
+TaskHandle_t xlua = NULL; // lua notification
 SemaphoreHandle_t x_wifi_connect;
+
+
+/*
+  1: recebe o tempo em mili de para da vTaskDelay
+*/
+int lua_sleep(lua_State *L) {
+    ESP_LOGI(LUA_TAG, "called lua_sleep");
+    int sleep_ms = luaL_checkinteger(L, 1);
+    vTaskDelay(sleep_ms / portTICK_PERIOD_MS);
+    return 0;
+}
 
 /*
   1: recebe o PIN no primeiro arg da stack
@@ -106,7 +120,6 @@ void wifi_station_task() {
     ESP_LOGI(TAG, "wifi connect give semphr");
 
     xSemaphoreGive(x_wifi_connect);
-
     while (1) {
         ESP_LOGI(TAG, "running wifi task");
         vTaskDelay(1000 / portTICK_PERIOD_MS);
@@ -146,19 +159,13 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
         ESP_LOGI(TAG, "MQTT_EVENT_DATA");
         printf("TOPIC=%.*s\r\n", event->topic_len, event->topic);
         printf("DATA=%.*s\r\n", event->data_len, event->data);
-	if (event->data_len >= MAX_CODE_SIZE) break;
-
-	// pega o semphr de codigo lua
-	if (xSemaphoreTake(x_lua_code, portMAX_DELAY) == pdTRUE) {
-	    // copia o data recebido via mqtt para o codigo lua da task da vm
-	    memcpy(CODE, event->data, event->data_len); 
-	    xSemaphoreGive(x_lua_code); // libera
-	    ESP_LOGI(TAG, "refreshed lua code %s", CODE);
-	} else {
-  	    ESP_LOGE(TAG, "failed to take x_lua_code semphr");
- 	    return;
-	}
 	
+	if (event->data_len >= MAX_CODE_SIZE) break;
+	
+	memset(CODE, '\0', MAX_CODE_SIZE); // reseta o buffer
+	memcpy(CODE, event->data, event->data_len); // copia o data recebido via mqtt para o codigo lua da task da vm
+	xTaskNotify(xlua, 0, eNoAction); // envia uma notificacao para task da vm lua
+	ESP_LOGI(TAG, "refreshed lua code %s", CODE);
         break;
     case MQTT_EVENT_ERROR:
         ESP_LOGI(TAG, "MQTT_EVENT_ERROR");
@@ -178,7 +185,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
 
 void mqtt_task() {
     esp_mqtt_client_config_t mqtt_cfg = {
-        .broker.address.uri = "mqtt://test.mosquitto.org",
+        .broker.address.uri = MQTT_BROKER_URI,
     };
 
     // pega o semphr de wifi
@@ -214,10 +221,6 @@ void mqtt_task() {
 
 void lua_vm_task(void *x_lua) {  
 
-    if (NULL == x_lua_code) {
-        ESP_LOGE(TAG, "failed to start lua vm task, NULL x_lua_code semphr");
-        return;
-    }
   
     lua_State *L = (lua_State *)x_lua;
 
@@ -239,6 +242,7 @@ void lua_vm_task(void *x_lua) {
     ESP_LOGI(TAG, "lua libs open");
 
     const struct luaL_Reg funcs_gpio[] = {
+      { "sleep", lua_sleep },
       { "blink", lua_blink },
       { "blink_period", lua_blink_period },
       { NULL, NULL },
@@ -252,39 +256,13 @@ void lua_vm_task(void *x_lua) {
 
     log_memory_usage("lua vm task memory");
     
-    //char *high = "gpio.blink(2, 1)";
-    //char *low = "gpio.blink(2, 0)";
-    
-    /* char *code2 = "gpio.blink_period(2, 10, 500)"; */
-    /* ESP_LOGI(LUA_TAG, "running gpio.blink_period(2, 10, 500)"); */
-    /* if (luaL_dostring(L, code2) == LUA_OK) { */
-    /*     lua_pop(L, lua_gettop(L)); */
-    /* } */
-    
     while (1) {
-        ESP_LOGI(LUA_TAG, "running lua task");
-	vTaskDelay(100 / portTICK_PERIOD_MS);
-	// pega o semphr de codigo lua
-	if (xSemaphoreTake(x_lua_code, portMAX_DELAY) == pdTRUE) {
-  	    ESP_LOGI(LUA_TAG, "running lua code %s", CODE);
-	    if (luaL_dostring(L, CODE) == LUA_OK) {
-  	        lua_pop(L, lua_gettop(L));
-    	    }
-	} else {
-	    ESP_LOGE(TAG, "failed to take x_lua_code semphr");
-	    continue;
+        ESP_LOGI(LUA_TAG, "running lua task waiting notification");
+	ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+	ESP_LOGI(LUA_TAG, "running lua code %s", CODE);
+	if (luaL_dostring(L, CODE) == LUA_OK) {
+	  lua_pop(L, lua_gettop(L));
 	}
-
-	//xSemaphoreGive(x_lua_code); // libera
-	
-
-	/* if (luaL_dostring(L, high) == LUA_OK) { */
-	/*     lua_pop(L, lua_gettop(L)); */
-	/* } */
-	/* vTaskDelay(500 / portTICK_PERIOD_MS); */
-	/* if (luaL_dostring(L, low) == LUA_OK) { */
-	/*     lua_pop(L, lua_gettop(L)); */
-	/* } */
     }
 }
 
@@ -302,22 +280,15 @@ void app_main(void) {
 
     TaskHandle_t xwifi = NULL;
     TaskHandle_t xmqtt = NULL;
-    TaskHandle_t xlua = NULL;
     lua_State *L = NULL;
 
     x_wifi_connect = xSemaphoreCreateBinary();
-    x_lua_code = xSemaphoreCreateBinary();
     
     if (NULL == x_wifi_connect) {
         ESP_LOGE(TAG, "failed to allocate semphr for wifi connection");
         return;
     }
 
-    if (NULL == x_lua_code) {
-        ESP_LOGE(TAG, "failed to allocate semphr for lua code");
-        return;
-    }
-    
     xTaskCreatePinnedToCore(&wifi_station_task, "wifi_sta_task", 4096, NULL, 3, &xwifi, 0);
     xTaskCreatePinnedToCore(&mqtt_task, "mqtt_task", 4096, NULL, 3, &xmqtt, 1);
     xTaskCreate(&lua_vm_task, "lua_vm_task", 4096, L, 4, &xlua);
